@@ -1,0 +1,7 @@
+numpy
+scipy
+pandas
+sympy
+spglib
+scikit-learn
+optuna
