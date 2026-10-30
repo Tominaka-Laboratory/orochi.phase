@@ -50,6 +50,12 @@ par = {
     # "site_symmetry_operations": {
     #     "value": np.array([["0","0","0"]])
     # },
+    "density": {
+        "value": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "fit": False,
+    },
     "lattice": {
         "value": np.array(
             [4.0, 4.0, 4.0, 90.0, 90.0, 90.0]
@@ -242,6 +248,12 @@ par_key_info = {  # key:{atribute:[type, index, shape]}
                         },
     # "site_symmetry_symbols": {"value": [str, None, (-1)]},
     # "site_symmetry_operations": {"value": [str, None, (-1,3)]},
+    "density": {
+        "value": [float, None, 1],
+        "min": [float, None, 1],
+        "max": [float, None, 1],
+        "fit": [bool, None, 1],
+    },
     "lattice": {
         "value": [float, None, (-1)],
         "min": [float, None, (-1)],

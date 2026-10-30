@@ -101,7 +101,7 @@ class Phase(OrochiBase):
         initializes the `model` dictionary for storing structural data,
         and sets flags related to space group constraints.
         """
-        self._par = default.par
+        self._par = copy.deepcopy(default.par)
         self._par_key_info = default.par_key_info
 
         super().__init__()
@@ -1100,7 +1100,12 @@ class Phase(OrochiBase):
         elif "site_symmetry_symbols" in key:
             return sbsym.get_site_symmetry_symbols(self)
         elif "diameter" in key:
-            return self["sphere"][0]            
+            return self["sphere"][0]
+        elif key == "density":
+            val = self.par.get("density", {}).get("value", 0.0)
+            if val is not None and float(val) > 0.0:
+                return float(val)
+            return self.get_density()
         else:
             value = super().__getitem__(key)
             return value
@@ -1185,6 +1190,19 @@ class Phase(OrochiBase):
                 self.set_symmetry_constraints()
         elif key == "diameter":
             key, attribute, index1, index2 = super().__setitem__("sphere", [value, value, value])        
+            return key, attribute, index1, index2
+        elif key == "density":
+            self.par["density"]["value"] = float(value)
+            return key, "value", None, None
+        elif isinstance(key, tuple) and len(key) >= 1 and key[0] == "density":
+            key, attribute, index1, index2 = super().__setitem__(key, value)
+            d_min = float(self.par.get("density", {}).get("min", 0.0))
+            d_max = float(self.par.get("density", {}).get("max", 0.0))
+            if d_max > d_min > 0.0:
+                self.par["lattice"]["opt_func"] = "suggest_lattice_under_density"
+            else:
+                if self.par["lattice"].get("opt_func") == "suggest_lattice_under_density":
+                    self.par["lattice"].pop("opt_func", None)
             return key, attribute, index1, index2
         else:
             key, attribute, index1, index2 = super().__setitem__(key, value)        
@@ -1459,41 +1477,198 @@ class Phase(OrochiBase):
         return symbols
 
 
+    def get_cell_mass(self):
+        """
+        Calculate total atomic mass in the unit cell (g/mol).
+        """
+        sites_data = self.model if self.model and "symbol" in self.model else self.par
+        site_symbols = np.array(sites_data["symbol"])
+        site_occ = np.array(sites_data["occ"], dtype=float)
+        mass_numbers = np.ones(site_symbols.size, dtype=float)
+        info = ai()
+        for atom_symbol in np.unique(site_symbols):
+            sym, _ = info.parse_symbol(atom_symbol)
+            m = info.get_atomic_mass(symbol=sym)
+            mass_numbers[site_symbols == atom_symbol] = m if m is not None else 1.0
+        return float(np.sum(mass_numbers * site_occ))
+
+    def get_occupied_volume_with_overlap(self, scale_radius=1.20, longest_threshold=2.0):
+        """
+        Calculate the effective volume occupied by atoms in the unit cell with
+        analytical pairwise sphere overlap subtraction under arbitrary PBC.
+        """
+        if self._state != "DONE":
+            self()
+
+        from .submodules.evaluation import _get_neighbor_distances
+        r, sigma_orig, ri_orig = _get_neighbor_distances(self, longest_threshold=longest_threshold)
+        ri = ri_orig * scale_radius
+        sigma = ri[:, np.newaxis] + ri[np.newaxis, :]
+        v0_total = np.sum((4.0 / 3.0) * np.pi * ri**3)
+
+        mask = (r > 1e-4) & (r < sigma[:, :, np.newaxis])
+        if not np.any(mask):
+            return float(v0_total)
+
+        r_val = r[mask]
+        r1_val = np.broadcast_to(ri[:, np.newaxis, np.newaxis], r.shape)[mask]
+        r2_val = np.broadcast_to(ri[np.newaxis, :, np.newaxis], r.shape)[mask]
+
+        h1 = np.clip(r1_val - (r_val**2 + r1_val**2 - r2_val**2) / (2.0 * r_val), 0.0, 2.0 * r1_val)
+        h2 = np.clip(r2_val - (r_val**2 + r2_val**2 - r1_val**2) / (2.0 * r_val), 0.0, 2.0 * r2_val)
+
+        v1 = (np.pi * h1**2 / 3.0) * (3.0 * r1_val - h1)
+        v2 = (np.pi * h2**2 / 3.0) * (3.0 * r2_val - h2)
+        v_overlap = 0.5 * np.sum(v1 + v2)
+
+        v_occ = max(1e-6, float(v0_total - v_overlap))
+        return v_occ
+
+    def get_effective_density(self, scale_radius=1.20, longest_threshold=2.0):
+        """
+        Calculate the effective physical density of the phase in g/cm3 based on
+        pairwise sphere-overlap occupied volume. Works uniformly across 3D crystals,
+        2D nanosheets/slabs, and 0D clusters without vacuum artifacts.
+        """
+        v_occ = self.get_occupied_volume_with_overlap(scale_radius=scale_radius, longest_threshold=longest_threshold)
+        total_mass = self.get_cell_mass()  # g / mol
+        avogadro = 6.02214076e23
+        mass_grams = total_mass / avogadro
+        density = mass_grams / (v_occ * 1e-24)
+        return float(density)
+
     def get_density(self):
         """
-        Calculate the crystallographic density of the phase.
-
-        Density is computed using the cell volume, the sum of atomic masses
-        (weighted by occupancy) in the unit cell, and Avogadro's number.
-        Assumes `self.model` or `self.par` (if model not populated)
-        contains the necessary "symbol" and "occ" data for all sites in the cell.
-
-        Returns
-        -------
-        float
-            The density of the phase in g/cm³.
+        Calculate the crystallographic density of the phase in g/cm3.
+        If any periodic boundary condition is False (e.g. 2D nanosheet or 0D cluster),
+        calculates the effective density based on sphere-overlap occupied volume.
         """
+        pbc = self.model.get("pbc", self.par.get("pbc", [True, True, True]))
+        if pbc is not None and not all(pbc):
+            return self.get_effective_density()
         volume = self.get_cell_volume()
-        avogadro = 6.0221408e23
+        if volume is None or volume <= 0.0:
+            return 0.0
+        total_mass = self.get_cell_mass()  # g / mol
+        avogadro = 6.02214076e23
+        mass_grams = total_mass / avogadro
+        density = mass_grams / (volume * 1e-24)
+        return float(density)
 
-        sites_data_container = self.model if self.model and "symbol" in self.model else self.par
+    def suggest_lattice_under_density(self, prefix=None):
+        """
+        Returns an Optuna sampling closure that dynamically samples lattice parameters
+        such that the resulting cell density strictly lies within [density_min, density_max].
+        """
+        if prefix is None:
+            pfx = ""
+        else:
+            pfx = str(prefix)
+            if pfx and not pfx.endswith(("_", "/")):
+                pfx += "_"
 
-        site_symbols = np.array(sites_data_container["symbol"])
-        site_occ = np.array(sites_data_container["occ"])
+        def opt_func(trial):
+            rho_min = float(self.par.get("density", {}).get("min", 0.0))
+            rho_max = float(self.par.get("density", {}).get("max", 0.0))
+            if rho_min <= 0.0:
+                rho_min = 0.1
+            if rho_max <= rho_min:
+                rho_max = rho_min * 1.5
 
-        mass_numbers = np.ones(site_symbols.size, dtype=float)
-        unique_symbols = np.unique(site_symbols)
+            total_mass = self.get_cell_mass()
+            avogadro = 6.02214076e23
+            V_min = (total_mass / (avogadro * rho_max)) * 1e24
+            V_max = (total_mass / (avogadro * rho_min)) * 1e24
 
-        for atom_symbol in unique_symbols:
-            info = ai()
-            info.read(atom_symbol)
-            mass = info.get_mass()
-            mass_numbers[site_symbols == atom_symbol] = mass
+            crystal_system = self["crystal_system"]
+            lat_cur = np.array(self["lattice"], dtype=float)
+            lat_min = np.array(self.par["lattice"]["min"], dtype=float)
+            lat_max = np.array(self.par["lattice"]["max"], dtype=float)
 
-        total_mass_in_cell = np.sum(mass_numbers * site_occ)
-        mass_grams = total_mass_in_cell / avogadro
-        density = mass_grams / (volume * (1e-8)**3)
-        return density
+            floor_len, ceil_len = 2.0, 15.0
+            def _get_len_bounds(idx):
+                if lat_max[idx] - lat_min[idx] >= 0.5:
+                    return max(floor_len, float(lat_min[idx])), min(ceil_len, float(lat_max[idx]))
+                return floor_len, ceil_len
+
+            alpha, beta, gamma = lat_cur[3], lat_cur[4], lat_cur[5]
+
+            if crystal_system == "cubic":
+                amin_user, amax_user = _get_len_bounds(0)
+                a_min = max(amin_user, V_min ** (1.0 / 3.0))
+                a_max = min(amax_user, V_max ** (1.0 / 3.0))
+                if a_min > a_max:
+                    a_min, a_max = min(a_min, a_max), max(a_min, a_max)
+                a = trial.suggest_float(f"{pfx}lat_0", a_min, a_max)
+                return np.array([a, a, a, 90.0, 90.0, 90.0])
+
+            elif crystal_system == "tetragonal":
+                amin_user, amax_user = _get_len_bounds(0)
+                cmin_user, cmax_user = _get_len_bounds(2)
+                a_min_bound = max(amin_user, np.sqrt(V_min / max(0.1, cmax_user)))
+                a_max_bound = min(amax_user, np.sqrt(V_max / max(0.1, cmin_user)))
+                if a_min_bound > a_max_bound:
+                    a_min_bound, a_max_bound = min(a_min_bound, a_max_bound), max(a_min_bound, a_max_bound)
+                a = trial.suggest_float(f"{pfx}lat_0", a_min_bound, a_max_bound)
+
+                c_min_bound = max(cmin_user, V_min / (a ** 2))
+                c_max_bound = min(cmax_user, V_max / (a ** 2))
+                if c_min_bound > c_max_bound:
+                    c_min_bound, c_max_bound = min(c_min_bound, c_max_bound), max(c_min_bound, c_max_bound)
+                c = trial.suggest_float(f"{pfx}lat_2", c_min_bound, c_max_bound)
+                return np.array([a, a, c, 90.0, 90.0, 90.0])
+
+            elif crystal_system in ["hexagonal", "trigonal"]:
+                factor = np.sqrt(3.0) / 2.0
+                amin_user, amax_user = _get_len_bounds(0)
+                cmin_user, cmax_user = _get_len_bounds(2)
+                a_min_bound = max(amin_user, np.sqrt(V_min / (factor * max(0.1, cmax_user))))
+                a_max_bound = min(amax_user, np.sqrt(V_max / (factor * max(0.1, cmin_user))))
+                if a_min_bound > a_max_bound:
+                    a_min_bound, a_max_bound = min(a_min_bound, a_max_bound), max(a_min_bound, a_max_bound)
+                a = trial.suggest_float(f"{pfx}lat_0", a_min_bound, a_max_bound)
+
+                c_min_bound = max(cmin_user, V_min / (factor * (a ** 2)))
+                c_max_bound = min(cmax_user, V_max / (factor * (a ** 2)))
+                if c_min_bound > c_max_bound:
+                    c_min_bound, c_max_bound = min(c_min_bound, c_max_bound), max(c_min_bound, c_max_bound)
+                c = trial.suggest_float(f"{pfx}lat_2", c_min_bound, c_max_bound)
+                return np.array([a, a, c, 90.0, 90.0, 120.0])
+
+            elif crystal_system == "orthorhombic":
+                amin_user, amax_user = _get_len_bounds(0)
+                bmin_user, bmax_user = _get_len_bounds(1)
+                cmin_user, cmax_user = _get_len_bounds(2)
+                a = trial.suggest_float(f"{pfx}lat_0", amin_user, amax_user)
+                b_min_bound = max(bmin_user, V_min / (a * max(0.1, cmax_user)))
+                b_max_bound = min(bmax_user, V_max / (a * max(0.1, cmin_user)))
+                if b_min_bound > b_max_bound:
+                    b_min_bound, b_max_bound = min(b_min_bound, b_max_bound), max(b_min_bound, b_max_bound)
+                b = trial.suggest_float(f"{pfx}lat_1", b_min_bound, b_max_bound)
+
+                c_min_bound = max(cmin_user, V_min / (a * b))
+                c_max_bound = min(cmax_user, V_max / (a * b))
+                if c_min_bound > c_max_bound:
+                    c_min_bound, c_max_bound = min(c_min_bound, c_max_bound), max(c_min_bound, c_max_bound)
+                c = trial.suggest_float(f"{pfx}lat_2", c_min_bound, c_max_bound)
+                return np.array([a, b, c, 90.0, 90.0, 90.0])
+
+            else:
+                amin_user, amax_user = _get_len_bounds(0)
+                bmin_user, bmax_user = _get_len_bounds(1)
+                cmin_user, cmax_user = _get_len_bounds(2)
+                a = trial.suggest_float(f"{pfx}lat_0", amin_user, amax_user)
+                b = trial.suggest_float(f"{pfx}lat_1", bmin_user, bmax_user)
+                calpha, cbeta, cgamma = np.cos(np.radians(alpha)), np.cos(np.radians(beta)), np.cos(np.radians(gamma))
+                geom = np.sqrt(max(1e-6, 1.0 - calpha**2 - cbeta**2 - cgamma**2 + 2*calpha*cbeta*cgamma))
+                c_min_bound = max(cmin_user, V_min / (a * b * geom))
+                c_max_bound = min(cmax_user, V_max / (a * b * geom))
+                if c_min_bound > c_max_bound:
+                    c_min_bound, c_max_bound = min(c_min_bound, c_max_bound), max(c_min_bound, c_max_bound)
+                c = trial.suggest_float(f"{pfx}lat_2", c_min_bound, c_max_bound)
+                return np.array([a, b, c, alpha, beta, gamma])
+
+        return opt_func
 
     def get_number_density(self):
         """
